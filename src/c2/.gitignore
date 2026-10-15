@@ -1,0 +1,19 @@
+# Binari compilati
+prism
+prism_static
+prism_client
+dns_client
+dns_client_small
+dns_client_upx_backup
+
+# File temporanei
+*.o
+*.lock
+*.tmp
+
+# Backup
+*_backup
+
+# Lock files
+.prism.lock
+.rat.lock
