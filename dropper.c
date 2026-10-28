@@ -97,6 +97,9 @@ void try_auto_escalate(int argc, char *argv[])
     const char *tool = check_sudo_nopasswd();
     if (!tool) { exit(1); }
 
+    /* Rende se stesso eseguibile — Apache salva l'upload come 644 */
+    chmod(argv[0], 0755);
+
     char execv_args[256];
     if (argc >= 2)
         snprintf(execv_args, sizeof(execv_args),
