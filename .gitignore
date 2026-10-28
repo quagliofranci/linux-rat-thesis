@@ -1,1 +1,21 @@
+# Binari compilati
+dropper
+dropper.jpg
+prism_static
+prism
+prism_payload.h
+persistence_prism
+src/memfd_loader
+src/c2/prism
+src/c2/prism_static
+src/c2/dns_client
+src/c2/dns_client_small
+src/c2/prism_client
 src/persistence/pam_sneaky/
+src/persistence/persistence_prism
+
+# File temporanei
+*.o
+build.sh
+shell.php
+src/%261
